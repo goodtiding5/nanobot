@@ -50,6 +50,14 @@ from rich.text import Text  # noqa: E402
 
 from nanobot import __logo__, __version__  # noqa: E402
 from nanobot.agent.loop import AgentLoop  # noqa: E402
+from nanobot.bus.outbound_events import (  # noqa: E402
+    ProgressEvent,
+    RetryWaitEvent,
+    StreamDeltaEvent,
+    StreamedResponseEvent,
+    StreamEndEvent,
+    outbound_event_from_message,
+)
 from nanobot.cli.gateway import create_gateway_app  # noqa: E402
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner  # noqa: E402
 from nanobot.config.paths import get_workspace_path, is_default_workspace  # noqa: E402
@@ -461,25 +469,25 @@ async def _maybe_print_interactive_progress(
     renderer: StreamRenderer | None = None,
     reasoning_buffer: _ReasoningBuffer | None = None,
 ) -> bool:
-    metadata = msg.metadata or {}
-    if metadata.get("_retry_wait"):
+    event = outbound_event_from_message(msg)
+    if isinstance(event, RetryWaitEvent):
         await _print_interactive_progress_line(msg.content, thinking, renderer)
         return True
 
-    if not metadata.get("_progress"):
+    if not isinstance(event, ProgressEvent):
         return False
 
     reasoning_buffer = reasoning_buffer or _ReasoningBuffer()
 
-    if metadata.get("_reasoning_end"):
+    if event.reasoning_end:
         if channels_config and not channels_config.show_reasoning:
             reasoning_buffer.clear()
         else:
             _flush_cli_reasoning(reasoning_buffer, thinking, renderer)
         return True
 
-    is_tool_hint = metadata.get("_tool_hint", False)
-    is_reasoning = metadata.get("_reasoning", False) or metadata.get("_reasoning_delta", False)
+    is_tool_hint = event.tool_hint
+    is_reasoning = event.reasoning or event.reasoning_delta
     if is_reasoning:
         if channels_config and not channels_config.show_reasoning:
             reasoning_buffer.clear()
@@ -798,14 +806,24 @@ def serve(
     console.print(f"  [cyan]Model[/cyan]    : {model_name}{preset_tag}")
     console.print("  [cyan]Session[/cyan]  : api:default")
     console.print(f"  [cyan]Timeout[/cyan]  : {timeout}s")
+    api_key = api_cfg.api_key.strip() if api_cfg.api_key else ""
     if host in {"0.0.0.0", "::"}:
+        if not api_key:
+            console.print(
+                "[red]Error: host is 0.0.0.0 (all interfaces) but api_key is not set. "
+                "Set api.api_key in config to prevent unauthenticated access.[/red]"
+            )
+            raise typer.Exit(1)
         console.print(
-            "[yellow]Warning:[/yellow] API is bound to all interfaces. "
-            "Only do this behind a trusted network boundary, firewall, or reverse proxy."
+            "[yellow]API is bound to all interfaces "
+            "(authentication required).[/yellow]"
         )
     console.print()
 
-    api_app = create_app(agent_loop, model_name=model_name, request_timeout=timeout)
+    api_app = create_app(
+        agent_loop, model_name=model_name, request_timeout=timeout,
+        api_key=api_key,
+    )
 
     async def on_startup(_app):
         await agent_loop._connect_mcp()
@@ -1446,7 +1464,7 @@ def agent(
             bus_task = asyncio.create_task(agent_loop.run())
             turn_done = asyncio.Event()
             turn_done.set()
-            turn_response: list[tuple[str, dict]] = []
+            turn_response: list[Any] = []
             renderer: StreamRenderer | None = None
             reasoning_buffer = _ReasoningBuffer()
 
@@ -1454,18 +1472,30 @@ def agent(
                 while True:
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+                        event = outbound_event_from_message(msg)
 
-                        if msg.metadata.get("_stream_delta"):
+                        if isinstance(event, StreamDeltaEvent):
                             if renderer:
                                 await renderer.on_delta(msg.content)
                             continue
-                        if msg.metadata.get("_stream_end"):
+                        if isinstance(event, StreamEndEvent):
                             if renderer:
                                 await renderer.on_end(
-                                    resuming=msg.metadata.get("_resuming", False),
+                                    resuming=event.resuming,
                                 )
                             continue
-                        if msg.metadata.get("_streamed"):
+                        if isinstance(event, StreamedResponseEvent):
+                            if msg.content and renderer and not renderer.streamed:
+                                await renderer.close()
+                                print_kwargs: dict[str, Any] = {}
+                                if renderer.header_printed:
+                                    print_kwargs["show_header"] = False
+                                _print_agent_response(
+                                    msg.content,
+                                    render_markdown=markdown,
+                                    metadata=msg.metadata,
+                                    **print_kwargs,
+                                )
                             turn_done.set()
                             continue
 
@@ -1480,7 +1510,7 @@ def agent(
 
                         if not turn_done.is_set():
                             if msg.content:
-                                turn_response.append((msg.content, dict(msg.metadata or {})))
+                                turn_response.append(msg)
                             turn_done.set()
                         elif msg.content:
                             await _print_interactive_response(
@@ -1533,8 +1563,10 @@ def agent(
                         await turn_done.wait()
 
                         if turn_response:
-                            content, meta = turn_response[0]
-                            if content and not meta.get("_streamed"):
+                            response_msg = turn_response[0]
+                            content = response_msg.content
+                            meta = response_msg.metadata
+                            if content and not isinstance(response_msg.event, StreamedResponseEvent):
                                 if renderer:
                                     await renderer.close()
                                 print_kwargs: dict[str, Any] = {}
