@@ -305,5 +305,8 @@ class ContextBuilder:
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=85)
             return buf.getvalue()
-        except ImportError:
+        except Exception:
+            # Resize is best-effort: if PIL is missing or the bytes are not a
+            # decodable image (e.g. truncated/placeholder data), fall back to
+            # sending the original bytes rather than blocking the image.
             return raw
